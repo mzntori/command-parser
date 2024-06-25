@@ -1,115 +1,321 @@
-use regex::Regex;
+use std::collections::{HashMap, HashSet};
+use crate::command::Command;
+use crate::error::ParseError;
+use crate::error::ParseError::{EscapeError, NameError, PrefixError};
 
-// <prefix><name> <arguments> -<option> -<parameter_key>:<parameter_value> -<parameter_key>:"<parameter_value>"
-// !ping mzntori "test test" -yes -t -mhm:true -test:"false stuff"
+#[derive(Debug, Copy, Clone)]
+enum ParseState {
+    Prefix,
+    Name,
+    Default,
+    Argument,
+    LongArgument,
+    EscapeLongArg,
+    Option,
+    ParamConnector,
+    ParamVal,
+    ParamLongVal,
+    EscapeLongParamVal,
+}
 
+/// Used to parse a [`Command`] from a string.
+///
+/// # Command Syntax
+///
+/// For more information about prefixes look at the fields of this struct.
+/// In any examples in this documentation `!` will be used as a prefix and `-` will be used as a option prefix.
+///
+/// A command that this can parse could look like this:
+///
+/// `!foo arg1 "long arg 2" -opt -opt -key1:val1 -key2:"long val2"`
+///
+/// A command consists of 4 different parts:
+/// - _name_: The name of the command is the first word after the prefix.
+/// In the example above that's `foo`.
+/// - _arguments_: Arguments are simple strings passed to the command.
+/// They are either single words or strings with spaces enclosed by `"`.
+/// In the example the two arguments are `arg1` and `long arg 2`.
+/// - _options_: Options are a set of words.
+/// They are prefixed with the `option_prefix`.
+/// The only option in the example is `opt`.
+/// - _parameters_: Parameters are key-value pairs.
+/// They are prefixed with the `option_prefix` and seperated by `:`.
+/// The value part of the pair can be a word or a string enclosed by `"`.
+/// In the example above `key1`s value is `val1` and `key2`s value is `long val2`.
+///
+/// # Escaping
+///
+/// Since `"` is used to mark the borders of long arguments and values, it's not normally possible
+/// to include them in the string of the argument.
+///
+/// You can escape a long argument or value using \\:
+/// - `\"`: produces `"`
+/// - `\\`: produces `\`
+///
+/// # Example
+///
+/// ```
+/// use std::collections::{HashMap, HashSet};
+/// use command_parser::{Parser, Command};
+///
+/// let p = Parser::new('!', '-');
+/// let command_string = r##"!foo arg1 "long arg 2" -opt -opt -key1:val1 -key2:"long val2""##;
+///
+/// let command = Command {
+///     prefix: '!',
+///     option_prefix: '-',
+///     name: "foo".to_string(),
+///     arguments: vec!["arg1".to_string(), "long arg 2".to_string()],
+///     options: HashSet::from(["opt".to_string()]),
+///     parameters: HashMap::from([
+///         ("key1".to_string(), "val1".to_string()),
+///         ("key2".to_string(), "long val2".to_string())
+///     ])
+/// };
+///
+/// assert_eq!(p.parse(command_string).unwrap(), command);
+/// ```
 #[derive(Debug)]
 pub struct Parser {
-    prefix: String,
-    name_regex: Regex,
-    option_prefix: String,
-    option_regex: Regex,
+    /// Prefix of the command.
+    ///
+    /// `<prefix><name> ...`
+    ///
+    /// Should not be set to `' '` as most chats trim leading spaces.
+    pub prefix: char,
+    /// Prefix of options and parameters.
+    ///
+    /// `... <option_prefix><option> ... <option_prefix><param key>:<param value>`
+    ///
+    /// Should not be set to `' '` or `'"'` as it may not result in expected outcomes.
+    pub option_prefix: char,
 }
 
 impl Parser {
-    pub fn new(prefix: String, option_prefix: String) -> Parser {
+    pub fn new(prefix: char, option_prefix: char) -> Parser {
         Parser {
-            name_regex: Parser::name_regex_from_prefix(prefix.as_str()),
             prefix,
-            option_regex: Self::option_regex_from_option_prefix(option_prefix.as_str()),
             option_prefix,
         }
     }
 
-    /// Checks whether a hay is a valid command.
-    /// If this is false, all parse methods will return [`None`] or an empty [`Vec`] by default.
-    ///
-    /// A valid command is defined by starting with the prefix returned by [`self.get_prefix`] as the first characters.
-    /// Followed by a valid command name.
-    /// A valid command name is any ASCII with at least 1 character.
-    /// A command name also can't contain a space as the second word will be counted as an argument.
-    /// This essentially checks if [`self.parse_name`] returns a valid name but with faster runtime.
-    ///
-    /// # Examples
-    /// Using `!` as a prefix:
-    ///
-    /// Valid commands:
-    /// - `!foo`
-    /// - `!foo bar` (`bar` is an argument and is not part of the name here)
-    /// - `!foo -bar`
-    /// - `!foo -bar:test`
-    ///
-    /// Invalid commands:
-    /// - `! do`
-    /// - `a! do`
-    /// - `\n! do`
-    pub fn valid(&self, hay: &str) -> bool {
-        self.name_regex.is_match(hay)
-    }
+    pub fn parse<'a>(&'_ self, raw: &'a str) -> Result<Command, ParseError> {
+        let mut name = String::new();
+        let mut arguments: Vec<String> = vec![];
+        let mut options: HashSet<String> = HashSet::new();
+        let mut parameters: HashMap<String, String> = HashMap::new();
 
-    /// Returns the command name of a given haystack.
-    /// If no command name could be found returns [`None`].
-    pub fn parse_name<'a>(&'_ self, hay: &'a str) -> Option<&'a str> {
-        if let Some(captures) = self.name_regex.captures(hay) {
-            captures.get(1).map(|v| { v.as_str() })
-        } else {
-            None
+        let mut state = ParseState::Prefix;
+        let mut buffer = String::new();
+        let mut key_buffer = String::new();
+
+        for (cursor, c) in raw.chars().enumerate() {
+            match state {
+                ParseState::Prefix => {
+                    match c {
+                        x if x == self.prefix => {
+                            state = ParseState::Name;
+                        }
+                        _ => {return Err(PrefixError(cursor, c))}
+                    }
+                }
+                ParseState::Name => {
+                    match c {
+                        ' ' => {
+                            if cursor == 1 {
+                                return Err(NameError(cursor, c));
+                            } else {
+                                state = ParseState::Default;
+                            }
+                        }
+                        _ => { name.push(c); }
+                    }
+                }
+                ParseState::Argument => {
+                    match c {
+                        ' ' => {
+                            arguments.push(buffer);
+                            buffer = String::new();
+                            state = ParseState::Default;
+                        }
+                        _ => {
+                            buffer.push(c);
+                        }
+                    }
+                }
+                ParseState::LongArgument => {
+                    match c {
+                        '"' => {
+                            arguments.push(buffer);
+                            buffer = String::new();
+                            state = ParseState::Default;
+                        }
+                        '\\' => {
+                            state = ParseState::EscapeLongArg;
+                        }
+                        _ => {
+                            buffer.push(c);
+                        }
+                    }
+                }
+                ParseState::EscapeLongArg => {
+                    match c {
+                        '"' | '\\' => {
+                            state = ParseState::LongArgument;
+                            buffer.push(c);
+                        }
+                        _ => {
+                            return Err(EscapeError(cursor, c));
+                        }
+                    }
+                }
+                ParseState::Option => {
+                    match c {
+                        ' ' => {
+                            options.insert(buffer);
+                            buffer = String::new();
+                            state = ParseState::Default;
+                        }
+                        ':' => {
+                            key_buffer = buffer;
+                            buffer = String::new();
+                            state = ParseState::ParamConnector;
+                        }
+                        _ => {
+                            buffer.push(c);
+                        }
+                    }
+                }
+                ParseState::ParamConnector => {
+                    match c {
+                        '"' => {
+                            state = ParseState::ParamLongVal;
+                        }
+                        ' ' => {
+                            parameters.insert(key_buffer, buffer);
+                            key_buffer = String::new();
+                            buffer = String::new();
+                            state = ParseState::Default;
+                        }
+                        _ => {
+                            state = ParseState::ParamVal;
+                            buffer.push(c);
+                        }
+                    }
+                }
+                ParseState::ParamVal => {
+                    match c {
+                        ' ' => {
+                            parameters.insert(key_buffer, buffer);
+                            key_buffer = String::new();
+                            buffer = String::new();
+                            state = ParseState::Default;
+                        }
+                        _ => {
+                            buffer.push(c);
+                        }
+                    }
+                }
+                ParseState::ParamLongVal => {
+                    match c {
+                        '"' => {
+                            parameters.insert(key_buffer, buffer);
+                            key_buffer = String::new();
+                            buffer = String::new();
+                            state = ParseState::Default;
+                        }
+                        '\\' => {
+                            state = ParseState::EscapeLongParamVal;
+                        }
+                        _ => {
+                            buffer.push(c);
+                        }
+                    }
+                }
+                ParseState::EscapeLongParamVal => {
+                    match c {
+                        '"' | '\\' => {
+                            state = ParseState::ParamLongVal;
+                            buffer.push(c);
+                        }
+                        _ => {
+                            return Err(EscapeError(cursor, c));
+                        }
+                    }
+                }
+                ParseState::Default => {
+                    match c {
+                        ' ' => {}
+                        '"' => {state = ParseState::LongArgument;}
+                        x if x == self.option_prefix => {
+                            state = ParseState::Option;
+                        }
+                        _ => {
+                            state = ParseState::Argument;
+                            buffer.push(c);
+                        }
+                    }
+                }
+            }
         }
-    }
 
-    pub fn parse_options<'a>(&'_ self, hay: &'a str) -> Vec<&'a str> {
-        // Check if valid.
-        let mut options: Vec<&'a str> = vec![];
-
-        if !self.valid(hay) {
-            return options;
-        }
-
-        for capture in self.option_regex.find_iter(hay) {
-            options.push(&capture.as_str().trim_end()[self.option_prefix.len()..]);
-        }
-
-        options
-    }
-
-    /// Sets the prefix to a given string.
-    /// Any ASCII string is valid.
-    pub fn set_prefix(&mut self, prefix: String) {
-        self.name_regex = Parser::name_regex_from_prefix(prefix.as_str());
-        self.prefix = prefix;
-    }
-
-    /// Returns a reference to the prefix.
-    pub fn get_prefix(&self) -> &str {
-        self.prefix.as_str()
-    }
-
-    fn name_regex_from_prefix(prefix: &str) -> Regex {
-        Regex::new(format!("\\A{}([^ ]+)", regex::escape(prefix)).as_str()).unwrap()
-    }
-
-    // "-([^ :]*)[^ ]*"
-    fn option_regex_from_option_prefix(option_prefix: &str) -> Regex {
-        Regex::new(format!(" {}([^ :]+)(?: |$)", regex::escape(option_prefix)).as_str()).unwrap()
+        Ok(Command {
+            prefix: self.prefix,
+            option_prefix: self.option_prefix,
+            name, arguments, options, parameters
+        })
     }
 }
 
 
 #[cfg(test)]
 pub mod tests {
+    use std::time::{Duration, Instant};
     use super::*;
 
     #[test]
-    fn test() {
-        // regex for command name (using ! as a prefix)
-        // let name_re = Regex::new(r"^!(.\w+)").unwrap();
-        // let hay = "!ping test";
+    fn parse_test() {
+        let p = Parser::new('!', '-');
+        let command_string = r##"!foo arg1 "long arg 2" -opt -opt -key1:val1 -key2:"long val2""##;
 
-        let parser = Parser::new("!".to_string(), "opt:".to_string());
-        let hay = r"!2 'test test2' 'test test1' opt:yes -tt -mhm:true -opt:'false stuff' -t";
-        dbg!(parser.valid(hay));
-        dbg!(parser.get_prefix());
-        dbg!(parser.parse_name(hay));
-        dbg!(parser.parse_options(hay));
+        let command = Command {
+            prefix: '!',
+            option_prefix: '-',
+            name: "foo".to_string(),
+            arguments: vec!["arg1".to_string(), "long arg 2".to_string()],
+            options: HashSet::from(["opt".to_string()]),
+            parameters: HashMap::from([
+                ("key1".to_string(), "val1".to_string()),
+                ("key2".to_string(), "long val2".to_string())
+            ])
+        };
+
+        assert_eq!(p.parse(command_string).unwrap(), command);
     }
+
+    #[test]
+    fn time_test() {
+        let p = Parser::new('!', '-');
+        let command_string = r##"!foo arg1 "long arg 2" -opt -opt -key1:val1 -key2:"long val2""##;
+
+        let now = Instant::now();
+
+        for _ in 0..100000 {
+            let _ = p.parse(command_string);
+        }
+
+        println!("{}", now.elapsed().as_micros());
+
+        let p = Parser::new('!', '-');
+        let command_string = r##"just a normal sentence"##;
+
+        let now = Instant::now();
+
+        for _ in 0..100000 {
+            let _ = p.parse(command_string);
+        }
+
+        println!("{}", now.elapsed().as_micros());
+    }
+
 }
