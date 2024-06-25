@@ -1,8 +1,11 @@
 [package]
 name = "command-parser"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+description = "parse commands for chat bots"
+readme = "README.md"
+license = "MIT"
+keywords = ["parser", "bot", "command"]
 
 [dependencies]
-regex = "1.10.5"
 thiserror = "1.0.61"
