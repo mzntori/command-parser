@@ -1,6 +1,5 @@
 //! # Command Syntax
 //!
-//! For more information about prefixes look at the fields of this struct.
 //! In any examples in this documentation `!` will be used as a prefix and `-` will be used as a option prefix.
 //!
 //! A command that this can parse could look like this:
