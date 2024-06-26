@@ -4,8 +4,9 @@ version = "0.0.1"
 edition = "2021"
 description = "parse commands for chat bots"
 readme = "README.md"
-repository = "https://github.com/mzntori/command-parser"
+documentation = "https://docs.rs/command-parser/latest"
 homepage = "https://github.com/mzntori/command-parser"
+repository = "https://github.com/mzntori/command-parser"
 license = "MIT"
 keywords = ["parser", "bot", "command"]
 
